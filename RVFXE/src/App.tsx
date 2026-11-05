@@ -29,6 +29,37 @@ import '../css/tailwind.min.css';
 import '../css/fonts.css';
 import '../css/style.css';
 
+// Reads converted JSONs in parallel (one IPC round trip each), keeping input order.
+async function readConvertedJsons(
+  result: { json_paths: string[]; uasset_paths: string[] },
+  toRelativePath: (parts: string[], fileName: string) => string,
+  onProgress: (done: number, total: number, fileName: string) => void,
+  onError: (fileName: string, err: unknown) => void,
+): Promise<{ fileObjects: FileObject[]; sourceMap: UassetSourceMap }> {
+  const total = result.json_paths.length;
+  let done = 0;
+  const loaded = await Promise.all(result.json_paths.map(async (jsonPath, i) => {
+    const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
+    try {
+      const content = await tauri.readTextFile(jsonPath) as string;
+      onProgress(++done, total, fileName);
+      const relativePath = toRelativePath(jsonPath.replace(/\\/g, '/').split('/'), fileName);
+      return { fileObject: { name: fileName, content, relativePath }, uassetPath: result.uasset_paths[i] || '', jsonPath };
+    } catch (err) {
+      onError(fileName, err);
+      return null;
+    }
+  }));
+  const fileObjects: FileObject[] = [];
+  const sourceMap: UassetSourceMap = {};
+  for (const item of loaded) {
+    if (!item) continue;
+    fileObjects.push(item.fileObject);
+    sourceMap[item.fileObject.relativePath] = { uassetPath: item.uassetPath, jsonPath: item.jsonPath };
+  }
+  return { fileObjects, sourceMap };
+}
+
 const DEFAULT_FILTER_DICTIONARY: FilterDictionary = {
   include_keywords: ['color', 'tint', 'Enemy', 'Emiss', 'Diff', 'XKTex3_Col'],
   exclude_keywords: ['Offset', 'uv', 'ColorMaskChannel', 'MaskColor_Enemy', 'MI_Master'],
@@ -247,23 +278,18 @@ export function App() {
           const newSourceMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
 
           const processResult = async (result: any, rootPath: string) => {
-            for (let i = 0; i < result.json_paths.length; i++) {
-              const jsonPath = result.json_paths[i];
-              const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
-              const uassetPath = result.uasset_paths[i] || '';
-              try {
-                const content = await tauri.readTextFile(jsonPath);
-                const parts = jsonPath.replace(/\\/g, '/').split('/');
-                const normalizedRoot = rootPath.replace(/\\/g, '/');
-                const rootName = normalizedRoot.split('/').pop() || '';
+            const rootName = rootPath.replace(/\\/g, '/').split('/').pop() || '';
+            const loaded = await readConvertedJsons(
+              result,
+              (parts, fileName) => {
                 const rootIdx = parts.indexOf(rootName);
-                const relativePath = rootIdx >= 0
-                  ? parts.slice(rootIdx).join('/')
-                  : `${rootName}/${fileName}`;
-                fileObjects.push({ name: fileName, content, relativePath });
-                newSourceMap[relativePath] = { uassetPath, jsonPath };
-              } catch (readErr) { debug.addLog(`Error reading converted JSON: ${readErr}`); }
-            }
+                return rootIdx >= 0 ? parts.slice(rootIdx).join('/') : `${rootName}/${fileName}`;
+              },
+              () => {},
+              (_, readErr) => debug.addLog(`Error reading converted JSON: ${readErr}`),
+            );
+            for (const f of loaded.fileObjects) fileObjects.push(f);
+            Object.assign(newSourceMap, loaded.sourceMap);
           };
 
           // Convert dropped directories
@@ -710,11 +736,14 @@ export function App() {
       for (const keyPath of filesToSave) {
         const sourceInfo = uassetSourceMap[keyPath];
         if (sourceInfo && sourceInfo.jsonPath && modifiedFiles[keyPath]) {
-          const jsonContent = JSON.stringify(modifiedFiles[keyPath], null, 2);
+          // Compact: only the converter reads it.
+          const jsonContent = JSON.stringify(modifiedFiles[keyPath]);
           const outputRelativePath = keyPath.replace(/\.json$/i, '.uasset');
+          // Never overwrite the cached JSON: it must keep the uasset's original values.
+          const editedPath = `${sourceInfo.jsonPath}.edited`;
           writePromises.push(
-            tauri.writeTextFile(sourceInfo.jsonPath, jsonContent).then(() => {
-              jsonPathsForConversion.push({ jsonPath: sourceInfo.jsonPath, outputName: outputRelativePath });
+            tauri.writeTextFile(editedPath, jsonContent).then(() => {
+              jsonPathsForConversion.push({ jsonPath: editedPath, outputName: outputRelativePath });
               writeProgress++;
               const displayName = outputRelativePath.split('/').pop();
               setConversionProgress({ current: writeProgress, total: totalToWrite, fileName: `Preparing: ${displayName}` });
@@ -788,35 +817,20 @@ export function App() {
         const result = await tauri.batchConvertDirectory(selectedPath);
         debug.addLog(`Batch conversion complete: ${result.json_paths.length} JSON files from ${result.uasset_paths.length} uassets`);
 
-        const fileObjects: FileObject[] = [];
-        const newSourceMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
-        const normalizedRoot = selectedPath.replace(/\\/g, '/');
+        const rootName = selectedPath.replace(/\\/g, '/').split('/').pop() || '';
 
         setConversionProgress({ current: 0, total: result.json_paths.length, fileName: 'Loading converted files...' });
 
-        for (let i = 0; i < result.json_paths.length; i++) {
-          const jsonPath = result.json_paths[i];
-          const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
-          const uassetPath = result.uasset_paths[i] || '';
-
-          try {
-            const content = await tauri.readTextFile(jsonPath);
-            const parts = jsonPath.replace(/\\/g, '/').split('/');
-            // Build relative path from the root directory name
-            const rootName = normalizedRoot.split('/').pop() || '';
+        // Relative path is anchored on the selected root directory's name.
+        const { fileObjects, sourceMap: newSourceMap } = await readConvertedJsons(
+          result,
+          (parts, fileName) => {
             const rootIdx = parts.indexOf(rootName);
-            const relativePath = rootIdx >= 0
-              ? parts.slice(rootIdx).join('/')
-              : `${rootName}/${fileName}`;
-
-            fileObjects.push({ name: fileName, content, relativePath });
-            newSourceMap[relativePath] = { uassetPath, jsonPath };
-
-            setConversionProgress({ current: i + 1, total: result.json_paths.length, fileName });
-          } catch (readErr) {
-            debug.addLog(`Failed to read ${fileName}: ${readErr}`);
-          }
-        }
+            return rootIdx >= 0 ? parts.slice(rootIdx).join('/') : `${rootName}/${fileName}`;
+          },
+          (current, total, fileName) => setConversionProgress({ current, total, fileName }),
+          (fileName, readErr) => debug.addLog(`Failed to read ${fileName}: ${readErr}`),
+        );
 
         if (fileObjects.length > 0) {
           setConversionProgress({ current: result.json_paths.length, total: result.json_paths.length, fileName: 'Extracting color parameters...' });
@@ -953,43 +967,22 @@ export function App() {
 
       debug.addLog(`Got ${result.json_paths.length} JSON files for ${heroName}${result.cached ? ' (cached)' : ''}`);
 
-      // Read all JSON files and feed into processFileObjects
-      const fileObjects: { name: string; content: string; relativePath: string }[] = [];
-      const newSourceMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
-
       setConversionProgress({ current: 0, total: result.json_paths.length, fileName: 'Loading converted files...' });
 
-      for (let i = 0; i < result.json_paths.length; i++) {
-        const jsonPath = result.json_paths[i];
-        const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
-        const uassetPath = result.uasset_paths[i] || '';
-
-        try {
-          const content = await tauri.readTextFile(jsonPath);
-          // Build a relative path. Skip cache path prefix dynamically:
-          const parts = jsonPath.replace(/\\/g, '/').split('/');
-          const customIdx = parts.findIndex(p => p === 'Custom');
-          const charsIdx = parts.findIndex(p => p === 'Characters');
-          let relativePath = '';
-          if (customIdx >= 0) {
-            relativePath = parts.slice(customIdx + 1).join('/');
-          } else if (charsIdx >= 0) {
-            const heroIdx = parts.indexOf(heroId, charsIdx + 1);
-            relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
-          } else {
-            const heroIdx = parts.lastIndexOf(heroId);
-            relativePath = heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
-          }
-
-          fileObjects.push({ name: fileName, content, relativePath });
-          newSourceMap[relativePath] = { uassetPath, jsonPath };
-
-          setConversionProgress({ current: i + 1, total: result.json_paths.length, fileName });
-        } catch (readErr) {
-          console.error('[App] Failed to read hero JSON:', jsonPath, readErr);
-          debug.addLog(`Failed to read ${fileName}: ${readErr}`);
-        }
-      }
+      // Read all JSON files and feed into processFileObjects
+      const { fileObjects, sourceMap: newSourceMap } = await readConvertedJsons(
+        result,
+        (parts, fileName) => {
+          // Skip cache path prefix dynamically
+          const customIdx = parts.indexOf('Custom');
+          if (customIdx >= 0) return parts.slice(customIdx + 1).join('/');
+          const charsIdx = parts.indexOf('Characters');
+          const heroIdx = charsIdx >= 0 ? parts.indexOf(heroId, charsIdx + 1) : parts.lastIndexOf(heroId);
+          return heroIdx >= 0 ? parts.slice(heroIdx).join('/') : `${heroId}/${fileName}`;
+        },
+        (current, total, fileName) => setConversionProgress({ current, total, fileName }),
+        (fileName, readErr) => debug.addLog(`Failed to read ${fileName}: ${readErr}`),
+      );
 
       if (fileObjects.length > 0) {
         setConversionProgress({ current: result.json_paths.length, total: result.json_paths.length, fileName: 'Extracting color parameters...' });
@@ -1035,33 +1028,19 @@ export function App() {
 
       debug.addLog(`Got ${result.json_paths.length} JSON files from manual extraction`);
 
-      const fileObjects: { name: string; content: string; relativePath: string }[] = [];
-      const newSourceMap: Record<string, { uassetPath: string; jsonPath: string }> = {};
-
       setConversionProgress({ current: 0, total: result.json_paths.length, fileName: 'Loading converted files...' });
 
-      for (let i = 0; i < result.json_paths.length; i++) {
-        const jsonPath = result.json_paths[i];
-        const fileName = jsonPath.split(/[\\/]/).pop() || 'unknown.json';
-        const uassetPath = result.uasset_paths[i] || '';
-
-        try {
-          const content = await tauri.readTextFile(jsonPath);
+      const { fileObjects, sourceMap: newSourceMap } = await readConvertedJsons(
+        result,
+        (parts, fileName) => {
           // Assets are extracted as <root>/Content/..., so anchor the display
           // path on the last Content segment to get the in-game path back.
-          const parts = jsonPath.replace(/\\/g, '/').split('/');
           const contentIdx = parts.lastIndexOf('Content');
-          const relativePath = contentIdx >= 0 ? parts.slice(contentIdx + 1).join('/') : fileName;
-
-          fileObjects.push({ name: fileName, content, relativePath });
-          newSourceMap[relativePath] = { uassetPath, jsonPath };
-
-          setConversionProgress({ current: i + 1, total: result.json_paths.length, fileName });
-        } catch (readErr) {
-          console.error('[App] Failed to read manual JSON:', jsonPath, readErr);
-          debug.addLog(`Failed to read ${fileName}: ${readErr}`);
-        }
-      }
+          return contentIdx >= 0 ? parts.slice(contentIdx + 1).join('/') : fileName;
+        },
+        (current, total, fileName) => setConversionProgress({ current, total, fileName }),
+        (fileName, readErr) => debug.addLog(`Failed to read ${fileName}: ${readErr}`),
+      );
 
       if (fileObjects.length > 0) {
         setConversionProgress({ current: result.json_paths.length, total: result.json_paths.length, fileName: 'Extracting color parameters...' });

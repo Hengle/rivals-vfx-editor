@@ -8,32 +8,23 @@ import type { ColorParam, FilterDictionary } from '@/types';
  * Check if a parameter name matches the filter dictionary rules.
  */
 export function paramMatchesFilter(paramName: string, filterDictionary: FilterDictionary): boolean {
-  if (!filterDictionary) return false;
+  return makeParamFilter(filterDictionary)(paramName);
+}
 
-  const paramNameLower = (paramName || '').toLowerCase();
+/**
+ * Build a param-name matcher with the keyword lists lowercased once, not per call.
+ */
+function makeParamFilter(filterDictionary: FilterDictionary): (paramName: string) => boolean {
+  if (!filterDictionary) return () => false;
   const includeKeywords = (filterDictionary.include_keywords || []).map(k => String(k).toLowerCase());
   const excludeKeywords = (filterDictionary.exclude_keywords || []).map(k => String(k).toLowerCase());
 
-  // include requires at least one include keyword (if include list empty => allow all)
-  const hasIncludeKeyword = includeKeywords.length === 0
-    ? true
-    : includeKeywords.some(keyword => paramNameLower.includes(keyword));
-
-  // substring exclusions (JSON-driven)
-  const hasExcludedKeyword = excludeKeywords.some(keyword => paramNameLower.includes(keyword));
-
-  // debug: show why a param is rejected
-  if (!hasIncludeKeyword || hasExcludedKeyword) {
-    console.debug('[paramMatchesFilter] excluded', {
-      paramName,
-      hasIncludeKeyword,
-      hasExcludedKeyword,
-      includeKeywords,
-      excludeKeywords,
-    });
-  }
-
-  return hasIncludeKeyword && !hasExcludedKeyword;
+  return (paramName: string) => {
+    const paramNameLower = (paramName || '').toLowerCase();
+    // include requires at least one include keyword (if include list empty => allow all)
+    const hasIncludeKeyword = includeKeywords.length === 0 || includeKeywords.some(k => paramNameLower.includes(k));
+    return hasIncludeKeyword && !excludeKeywords.some(k => paramNameLower.includes(k));
+  };
 }
 
 /**
@@ -47,31 +38,36 @@ function getColorPropertyNames(filterDictionary: FilterDictionary): string[] {
   ];
 }
 
+interface ScanContext {
+  fileName: string;
+  relativePath: string;
+  allParams: ColorParam[];
+  colorNames: Set<string>;
+  matchesFilter: (paramName: string) => boolean;
+}
+
 /**
  * Recursively search a nested object tree for color properties.
+ * currentPath is mutated and restored; it is only copied when a color is found.
  */
 function findColorsRecursive(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   currentObject: any,
   currentPath: (string | number)[],
-  fileName: string,
   parentName: string,
-  allParams: ColorParam[],
-  relativePath: string,
-  filterDictionary: FilterDictionary
+  ctx: ScanContext
 ): void {
   if (!currentObject || typeof currentObject !== 'object') return;
 
-  const colorNames = getColorPropertyNames(filterDictionary);
-  const isColorProperty = colorNames.includes(currentObject.Name) && currentObject.StructType === 'LinearColor';
-  const colorValue = currentObject?.Value?.[0]?.Value;
+  const isColorProperty = currentObject.StructType === 'LinearColor' && ctx.colorNames.has(currentObject.Name);
+  const colorValue = isColorProperty ? currentObject.Value?.[0]?.Value : undefined;
 
-  if (isColorProperty && colorValue && typeof colorValue.R !== 'undefined') {
+  if (colorValue && typeof colorValue.R !== 'undefined') {
     const paramName = `${parentName} - ${currentObject.Name}`;
 
-    if (!paramMatchesFilter(paramName, filterDictionary)) return;
+    if (!ctx.matchesFilter(paramName)) return;
 
-    const id = `${relativePath}-${parentName}-${currentObject.Name}-${allParams.length}`;
+    const id = `${ctx.relativePath}-${parentName}-${currentObject.Name}-${ctx.allParams.length}`;
     const path = [...currentPath, 'Value', 0, 'Value'];
 
     const sanitizedRgba = {
@@ -81,18 +77,19 @@ function findColorsRecursive(
       A: parseFloat(colorValue.A) || 0,
     };
 
-    allParams.push({ id, fileName, paramName, path, rgba: sanitizedRgba, relativePath });
-    console.debug('[findColorsRecursive] Found color:', paramName, sanitizedRgba);
+    ctx.allParams.push({ id, fileName: ctx.fileName, paramName, path, rgba: sanitizedRgba, relativePath: ctx.relativePath });
+  } else if (Array.isArray(currentObject)) {
+    for (let index = 0; index < currentObject.length; index++) {
+      currentPath.push(index);
+      findColorsRecursive(currentObject[index], currentPath, parentName, ctx);
+      currentPath.pop();
+    }
   } else {
-    if (Array.isArray(currentObject)) {
-      currentObject.forEach((item, index) => {
-        findColorsRecursive(item, [...currentPath, index], fileName, parentName, allParams, relativePath, filterDictionary);
-      });
-    } else {
-      for (const key in currentObject) {
-        if (Object.prototype.hasOwnProperty.call(currentObject, key)) {
-          findColorsRecursive(currentObject[key], [...currentPath, key], fileName, parentName, allParams, relativePath, filterDictionary);
-        }
+    for (const key in currentObject) {
+      if (Object.prototype.hasOwnProperty.call(currentObject, key)) {
+        currentPath.push(key);
+        findColorsRecursive(currentObject[key], currentPath, parentName, ctx);
+        currentPath.pop();
       }
     }
   }
@@ -110,6 +107,14 @@ export function parseJsonAndExtractColors(
   filterDictionary: FilterDictionary,
   addDebugLog: (msg: string) => void
 ): void {
+  const matchesFilter = makeParamFilter(filterDictionary);
+  const ctx: ScanContext = {
+    fileName,
+    relativePath,
+    allParams,
+    colorNames: new Set(getColorPropertyNames(filterDictionary)),
+    matchesFilter,
+  };
   const firstExport = Array.isArray(json?.Exports) ? json.Exports[0] : null;
   const firstExportData = firstExport?.Data;
 
@@ -134,7 +139,7 @@ export function parseJsonAndExtractColors(
       const paramName = paramInfo?.Value?.find((p: any) => p.Name === 'Name')?.Value;
 
       if (paramName) {
-        if (!paramMatchesFilter(paramName, filterDictionary)) return;
+        if (!matchesFilter(paramName)) return;
 
         const paramValueObj = param?.Value?.find((p: any) => p.Name === 'ParameterValue');
         const linearColor = paramValueObj?.Value?.find((p: any) => p.Name === 'ParameterValue')?.Value;
@@ -171,7 +176,7 @@ export function parseJsonAndExtractColors(
       if (row.StructType === 'RichTextStyleRow') {
         const styleName = row.Name;
         const rowPath = [...tablePath, rowIndex, 'Value'];
-        findColorsRecursive(row.Value, rowPath, fileName, styleName, allParams, relativePath, filterDictionary);
+        findColorsRecursive(row.Value, rowPath, styleName, ctx);
       }
     });
   }
@@ -181,7 +186,7 @@ export function parseJsonAndExtractColors(
       if (Array.isArray(exportItem.Data)) {
         const parentName = exportItem.ObjectName || `Export_${exportIndex}`;
         const basePath: (string | number)[] = ['Exports', exportIndex, 'Data'];
-        findColorsRecursive(exportItem.Data, basePath, fileName, parentName, allParams, relativePath, filterDictionary);
+        findColorsRecursive(exportItem.Data, basePath, parentName, ctx);
       } else if (typeof exportItem.Data === 'string') {
         console.warn(`Skipping RawExport entry during generic color scan: ${fileName}`, {
           relativePath,

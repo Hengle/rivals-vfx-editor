@@ -295,7 +295,8 @@ fn save_cache_index(index: &CacheIndex) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let json = serde_json::to_string_pretty(index).map_err(|e| e.to_string())?;
+    // Compact: the index is rewritten whole and grows with every converted asset.
+    let json = serde_json::to_vec(index).map_err(|e| e.to_string())?;
     fs::write(&path, json).map_err(|e| e.to_string())
 }
 
@@ -474,15 +475,12 @@ async fn send_tool_request(
     proc: &mut UAssetToolProcess,
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let request_str = serde_json::to_string(request).map_err(|e| e.to_string())?;
+    let mut request_bytes = serde_json::to_vec(request).map_err(|e| e.to_string())?;
+    request_bytes.push(b'\n');
     proc.stdin
-        .write_all(request_str.as_bytes())
+        .write_all(&request_bytes)
         .await
         .map_err(|e| format!("Failed to write to UAssetTool stdin: {}", e))?;
-    proc.stdin
-        .write_all(b"\n")
-        .await
-        .map_err(|e| format!("Failed to write newline to UAssetTool stdin: {}", e))?;
     proc.stdin
         .flush()
         .await
@@ -1230,13 +1228,13 @@ async fn batch_convert_uassets_to_json(
         succeeded += s;
         failed += f;
 
-        // Apply cache updates
         let mut cache_index = state.cache_index.lock().unwrap();
         for (key, entry) in chunk_cache_updates {
             cache_index.entries.insert(key, entry);
         }
-        let _ = save_cache_index(&cache_index);
     }
+    // Once per batch, not once per worker chunk.
+    let _ = save_cache_index(&state.cache_index.lock().unwrap());
 
     Ok(BatchConversionResult {
         total,
@@ -1359,8 +1357,14 @@ async fn batch_convert_jsons_to_uassets(
             }
         }
 
-        match fs::copy(json_path, &staged_json_path) {
-            Ok(_) => {
+        // Inputs are throwaway edit files beside the cache, so move rather than copy.
+        let staged = fs::rename(json_path, &staged_json_path).or_else(|_| {
+            fs::copy(json_path, &staged_json_path).map(|_| {
+                let _ = fs::remove_file(json_path);
+            })
+        });
+        match staged {
+            Ok(()) => {
                 let staged = staged_json_path.to_string_lossy().to_string();
                 staged_file_paths.push(staged.clone());
                 entries.push(EntryState {
@@ -1749,7 +1753,7 @@ async fn load_locres_data(
         "file_path": locres_file.to_string_lossy(),
     });
 
-    let response = send_tool_request(proc, &request).await?;
+    let mut response = send_tool_request(proc, &request).await?;
     drop(process_guard);
 
     let success = response.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1758,7 +1762,8 @@ async fn load_locres_data(
         return Err(format!("Failed to parse Game.locres: {}", msg));
     }
 
-    let data = response.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    // Move the locres tree out instead of deep-cloning it.
+    let data = response.get_mut("data").map(serde_json::Value::take).unwrap_or_default();
     let namespace_count = data.as_object().map(|o| o.len()).unwrap_or(0);
 
     eprintln!("[DEBUG] Parsed locres: {} namespaces", namespace_count);
@@ -1769,7 +1774,7 @@ async fn load_locres_data(
     // Cache the locres data
     let cache_dir = get_hero_cache_dir();
     fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
-    let cache_json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+    let cache_json = serde_json::to_vec(&data).map_err(|e| e.to_string())?;
     fs::write(&locres_cache_path, &cache_json).map_err(|e| e.to_string())?;
     eprintln!("[DEBUG] Cached locres data to {:?}", locres_cache_path);
 
@@ -2072,7 +2077,7 @@ async fn get_hero_roster(
     // Cache the roster
     let cache_dir = get_hero_cache_dir();
     fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
-    let cache_json = serde_json::to_string_pretty(&heroes).map_err(|e| e.to_string())?;
+    let cache_json = serde_json::to_vec(&heroes).map_err(|e| e.to_string())?;
     fs::write(&roster_cache_path, &cache_json).map_err(|e| e.to_string())?;
     eprintln!("[DEBUG] Cached {} heroes to {:?}", heroes.len(), roster_cache_path);
 
